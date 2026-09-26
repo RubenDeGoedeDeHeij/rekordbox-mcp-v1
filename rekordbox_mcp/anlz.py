@@ -254,10 +254,13 @@ def plan_cues(db: Any, content: Any, cues: list[dict[str, Any]], replace_existin
 def apply_cues(db: Any, content: Any, plan: dict[str, Any]) -> dict[str, Any]:
     if plan["conflicts"]:
         raise CueFormatError(f"Bestaande cues op dezelfde slots/tijden: {plan['conflicts']}. Gebruik replace_existing=true.")
+    from . import cloud
+
+    mode, _why = cloud.delete_mode(db, "djmdCue")
     removed = 0
     for e in plan["will_remove"]:
         row = db.query(tables.DjmdCue).filter_by(ID=e["id"]).one()
-        db.delete(row)
+        cloud.remove(db, row, mode)
         removed += 1
     created = []
     for r in plan["new_cues"]:

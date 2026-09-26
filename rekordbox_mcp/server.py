@@ -20,7 +20,7 @@ try:  # mcp >= 2
 except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server  # type: ignore
 
-from . import anlz, library, playlists, safety, sets
+from . import anlz, cloud, library, playlists, safety, sets
 from . import settings as rb_settings
 from .config import get_config
 from .db import (
@@ -74,6 +74,18 @@ def _tool(fn):
     return fn
 
 
+SYNC_NOTE = ("Cloud Library Sync is actief: open na deze wijziging eerst Rekordbox op DEZE Mac en laat de "
+             "sync afronden voordat je op een ander apparaat iets aanpast (voorkomt sync-conflicten).")
+
+
+def _gw(db: Any, action: str, **kwargs: Any) -> dict:
+    """guarded_write + Cloud Library Sync notice in plan and result."""
+    status = cloud.cloud_sync_status(db)
+    if status["sync_active"]:
+        kwargs["plan"] = {**kwargs["plan"], "cloud_sync_note": SYNC_NOTE}
+    return safety.guarded_write(action, **kwargs)
+
+
 # ======================================================================================
 # Status / read-only
 # ======================================================================================
@@ -97,11 +109,38 @@ def get_status() -> dict:
         tracks = all_tracks(db)
         info["tracks"] = len(tracks)
         info["tracks_missing_file"] = sum(1 for t in tracks if not file_exists(t.FolderPath))
+        info["files"] = cloud.summarize_files(tracks)
+        info["cloud_library_sync_active"] = cloud.cloud_sync_status(db)["sync_active"]
         info["playlists"] = len(playlists.list_playlists(db))
     backups = safety.list_backups(cfg)
     info["backups"] = len(backups)
     info["last_backup"] = backups[0]["backup_path"] if backups else None
     return info
+
+
+@_tool
+def get_cloud_status() -> dict:
+    """Cloud Library Sync + Google Drive/Dropbox-diagnose: is sync actief (en waarom), welke
+    verwijder-strategie wordt gebruikt (soft/hard) per tabel, hoeveel tracks lokaal / alleen online
+    (cloud-placeholder) / ontbrekend zijn, gevonden cloud-mappen en of rekordboxAgent draait."""
+    with open_db() as db:
+        status = cloud.cloud_sync_status(db)
+        tracks = all_tracks(db)
+        modes = {t: dict(zip(("mode", "reason"), cloud.delete_mode(db, t, status))) for t in
+                 ("djmdContent", "djmdPlaylist", "djmdSongPlaylist", "djmdCue")}
+        online = [track_label(t) for t in tracks if cloud.file_state(t.FolderPath) == "online_only"][:20]
+        return {
+            **status,
+            "delete_strategy": modes,
+            "files": cloud.summarize_files(tracks),
+            "examples_online_only": online,
+            "cloud_storage_roots": [str(r) for r in cloud.cloud_storage_roots()],
+            "advice": (
+                "Werkvolgorde met sync: laat Rekordbox eerst volledig syncen, sluit Rekordbox, voer MCP-acties uit, "
+                "open daarna Rekordbox op deze Mac zodat de wijzigingen geüpload worden. Online-only tracks worden "
+                "niet getagd of verplaatst; bestanden in Google Drive/Dropbox worden nooit naar buiten verplaatst."
+            ),
+        }
 
 
 @_tool
@@ -129,12 +168,15 @@ def search_tracks(
     energy_max: int | None = None,
     rating_min: int | None = None,
     only_existing_files: bool = False,
+    only_local_files: bool = False,
     limit: int = 50,
 ) -> dict:
     """Zoek tracks op tekst (artiest/titel/album/pad), BPM-range, genre(s), key (Am / 8A),
-    energy (uit comment, Mixed In Key-stijl) of rating."""
+    energy (uit comment, Mixed In Key-stijl) of rating. only_local_files sluit cloud-placeholders
+    (alleen online in Google Drive/Dropbox) uit."""
     with open_db() as db:
-        res = _search(db, query, bpm_min, bpm_max, genres, key, energy_min, energy_max, rating_min, only_existing_files)
+        res = _search(db, query, bpm_min, bpm_max, genres, key, energy_min, energy_max, rating_min,
+                      only_existing_files, only_local_files)
         return {"count": len(res), "tracks": [track_to_dict(t) for t in res[:limit]]}
 
 
@@ -170,7 +212,7 @@ def create_playlist(name: str, parent: str | None = None, is_folder: bool = Fals
             db.commit()
             return {"id": str(pl.ID), "created_folders": folders}
 
-        return safety.guarded_write("create_playlist", dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, "create_playlist", dry_run=dry_run, plan=plan, apply=apply,
                                     rollback=db.rollback)
 
 
@@ -179,16 +221,18 @@ def delete_playlist(playlist: str, dry_run: bool = True) -> dict:
     """Verwijder een playlist of folder (folder: inclusief inhoud). Tracks blijven in de collectie."""
     with open_db() as db:
         pl = playlists.resolve_playlist(db, playlist)
-        plan = {"delete": playlist, "id": str(pl.ID), "type": "folder" if pl.Attribute == 1 else "playlist"}
+        mode, why = cloud.delete_mode(db, "djmdPlaylist")
+        plan = {"delete": playlist, "id": str(pl.ID), "type": "folder" if pl.Attribute == 1 else "playlist",
+                "delete_mode": f"{mode} ({why})"}
         if pl.Attribute == 0:
             plan["tracks_in_playlist"] = len(playlists.playlist_songs(db, pl))
 
         def apply() -> dict:
-            db.delete_playlist(pl)
+            ids = cloud.delete_playlist(db, pl, mode)
             db.commit()
-            return {"deleted": str(pl.ID)}
+            return {"deleted": ids, "delete_mode": mode}
 
-        return safety.guarded_write("delete_playlist", dry_run=dry_run, plan=plan, apply=apply, rollback=db.rollback)
+        return _gw(db, "delete_playlist", dry_run=dry_run, plan=plan, apply=apply, rollback=db.rollback)
 
 
 @_tool
@@ -225,7 +269,7 @@ def add_tracks_to_playlist(
             db.commit()
             return {"playlist_id": str(target.ID), "added": added}
 
-        return safety.guarded_write("add_tracks_to_playlist", dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, "add_tracks_to_playlist", dry_run=dry_run, plan=plan, apply=apply,
                                     tracks=[track_label(t) for t in found], rollback=db.rollback)
 
 
@@ -239,16 +283,18 @@ def remove_tracks_from_playlist(playlist: str, tracks: list[str], dry_run: bool 
             raise ValueError(_out({"unresolved_tracks": errors}))
         ids = {str(t.ID) for t in found}
         songs = [s for s in playlists.playlist_songs(db, pl) if str(s.ContentID) in ids]
-        plan = {"playlist": pl.Name, "remove": [f"#{s.TrackNo} {track_label(s.Content)}" for s in songs],
+        mode, why = cloud.delete_mode(db, "djmdSongPlaylist")
+        plan = {"playlist": pl.Name, "delete_mode": f"{mode} ({why})",
+                "remove": [f"#{s.TrackNo} {track_label(s.Content)}" for s in songs],
                 "not_in_playlist": [track_label(t) for t in found if str(t.ID) not in {str(s.ContentID) for s in songs}]}
 
         def apply() -> dict:
-            for s in songs:
-                db.remove_from_playlist(pl, s)
+            for s in sorted(songs, key=lambda x: x.TrackNo or 0, reverse=True):
+                cloud.remove_song_from_playlist(db, str(pl.ID), s, mode)
             db.commit()
             return {"removed": len(songs)}
 
-        return safety.guarded_write("remove_tracks_from_playlist", dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, "remove_tracks_from_playlist", dry_run=dry_run, plan=plan, apply=apply,
                                     tracks=[track_label(t) for t in found], rollback=db.rollback)
 
 
@@ -283,7 +329,7 @@ def reorder_playlist(playlist: str, order: list[str] | None = None, sort_by: str
             db.commit()
             return {"reordered": len(new)}
 
-        return safety.guarded_write("reorder_playlist", dry_run=dry_run, plan=plan, apply=apply, rollback=db.rollback)
+        return _gw(db, "reorder_playlist", dry_run=dry_run, plan=plan, apply=apply, rollback=db.rollback)
 
 
 # ======================================================================================
@@ -360,7 +406,7 @@ def build_set_from_criteria(
             db.commit()
             return {"playlist_id": str(pl.ID), "tracks_added": len(ordered)}
 
-        return safety.guarded_write("build_set_from_criteria", dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, "build_set_from_criteria", dry_run=dry_run, plan=plan, apply=apply,
                                     tracks=[track_label(t) for t in ordered], rollback=db.rollback)
 
 
@@ -404,7 +450,7 @@ def _genre_write(action: str, targets_spec: list[tuple[str | None, str | None]],
             db.rollback()
             library.undo_moves(moved)
 
-        return safety.guarded_write(action, dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, action, dry_run=dry_run, plan=plan, apply=apply,
                                     tracks=[c["track"] for c in effective], rollback=rollback)
 
 
@@ -484,39 +530,50 @@ def dedupe_library(
 
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         trash_root = cfg.trash_dir / stamp
+        mode, why = cloud.delete_mode(db, "djmdContent")
+        roots = cloud.cloud_storage_roots()
         plan_items = []
         for keeper, losers in work:
             for loser in losers:
                 move = None
-                if trash_duplicate_files and file_exists(loser.FolderPath) and (
-                    not file_exists(keeper.FolderPath)
-                    or Path(loser.FolderPath).resolve() != Path(keeper.FolderPath).resolve()
-                ):
-                    move = str(trash_root / f"{loser.ID}_{Path(loser.FolderPath).name}")
-                plan_items.append({"keeper": track_label(keeper), "remove_db_entry": track_label(loser),
-                                   "loser_path": loser.FolderPath, "loser_file_exists": file_exists(loser.FolderPath),
-                                   "move_file_to_trash": move})
-        plan = {"groups_processed": len(work), "entries_to_remove": len(plan_items), "items": plan_items}
+                state = cloud.file_state(loser.FolderPath)
+                same_file = file_exists(keeper.FolderPath) and file_exists(loser.FolderPath) and (
+                    Path(loser.FolderPath).resolve() == Path(keeper.FolderPath).resolve())
+                note = None
+                if trash_duplicate_files and state == "local" and not same_file:
+                    if cloud.in_cloud_storage(loser.FolderPath, roots):
+                        note = "bestand staat in Google Drive/Dropbox: niet verplaatst (alleen DB opgeruimd)"
+                    else:
+                        move = str(trash_root / f"{loser.ID}_{Path(loser.FolderPath).name}")
+                elif state == "online_only":
+                    note = "bestand staat alleen online: niet verplaatst (alleen DB opgeruimd)"
+                item = {"keeper": track_label(keeper), "remove_db_entry": track_label(loser),
+                        "loser_path": loser.FolderPath, "loser_file_state": state, "move_file_to_trash": move}
+                if note:
+                    item["file_note"] = note
+                plan_items.append(item)
+        plan = {"groups_processed": len(work), "entries_to_remove": len(plan_items),
+                "delete_mode": f"{mode} ({why})", "items": plan_items}
         moved: list[tuple[str, str]] = []
 
         def apply() -> dict:
             stats = []
             for keeper, losers in work:
                 for loser in losers:
-                    stats.append({"removed": track_label(loser), **library.merge_into_keeper(db, keeper, loser)})
+                    stats.append({"removed": track_label(loser), **library.merge_into_keeper(db, keeper, loser, mode)})
             db.commit()  # one commit for all deletes
             for item in plan_items:
                 if item["move_file_to_trash"]:
                     trash_root.mkdir(parents=True, exist_ok=True)
                     shutil.move(item["loser_path"], item["move_file_to_trash"])
                     moved.append((item["loser_path"], item["move_file_to_trash"]))
-            return {"merged": stats, "files_moved_to_trash": moved}
+            return {"merged": stats, "delete_mode": mode, "files_moved_to_trash": moved}
 
         def rollback() -> None:
             db.rollback()
             library.undo_moves(moved)
 
-        return safety.guarded_write("dedupe_library", dry_run=dry_run, plan=plan, apply=apply,
+        return _gw(db, "dedupe_library", dry_run=dry_run, plan=plan, apply=apply,
                                     tracks=[p["remove_db_entry"] for p in plan_items], rollback=rollback)
 
 
@@ -593,7 +650,7 @@ def write_cue_points(track: str, cues: list[dict], replace_existing: bool = Fals
             if problems and not force:
                 raise anlz.CueFormatError("Execute geweigerd, er is niets geschreven: " + " | ".join(problems)
                                           + " Gebruik force=true alleen als je dit bewust accepteert.")
-        return safety.guarded_write("write_cue_points", dry_run=(mode != "execute"), plan=plan,
+        return _gw(db, "write_cue_points", dry_run=(mode != "execute"), plan=plan,
                                     apply=lambda: anlz.apply_cues(db, content, plan),
                                     tracks=[track_label(content)], rollback=db.rollback)
 
@@ -616,7 +673,7 @@ def write_beatgrid(track: str, bpm: float, first_beat: str, first_beat_number: i
             anlz.restore_anlz(originals)
             db.rollback()
 
-        return safety.guarded_write("write_beatgrid", dry_run=(mode != "execute"), plan=plan,
+        return _gw(db, "write_beatgrid", dry_run=(mode != "execute"), plan=plan,
                                     apply=lambda: anlz.apply_beatgrid(db, content, plan, originals),
                                     tracks=[track_label(content)], rollback=rollback)
 

@@ -61,6 +61,7 @@ async def run(env: dict[str, str], cue_track: str | None) -> int:
                 return data
 
             await call("get_status")
+            await call("get_cloud_status", max_lines=50)
             pls = await call("list_playlists", max_lines=40)
             await call("create_playlist", {"name": "MCP Selftest", "parent": "Sets/Selftest", "dry_run": True})
 

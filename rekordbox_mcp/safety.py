@@ -43,35 +43,42 @@ class BackupError(RuntimeError):
 # --------------------------------------------------------------------------------------
 
 
-def find_rekordbox_processes() -> list[dict[str, Any]]:
-    """Return running Rekordbox *application* processes.
-
-    The background ``rekordboxAgent`` (cloud sync helper) is ignored: it keeps
-    running after the app is closed and does not hold the database.
-    """
+def find_processes(names: set[str]) -> list[dict[str, Any]]:
+    """Running processes whose name (or executable name) is in ``names`` (lowercase)."""
     found: dict[int, dict[str, Any]] = {}
     try:
         import psutil
 
         for proc in psutil.process_iter(["pid", "name", "exe"]):
             name = (proc.info.get("name") or "").lower()
-            exe = (proc.info.get("exe") or "").lower()
-            exe_name = os.path.basename(exe)
-            if name in REKORDBOX_PROCESS_NAMES or exe_name in REKORDBOX_PROCESS_NAMES:
+            exe_name = os.path.basename((proc.info.get("exe") or "").lower())
+            if name in names or exe_name in names:
                 found[proc.info["pid"]] = {"pid": proc.info["pid"], "name": proc.info.get("name"), "exe": proc.info.get("exe")}
     except Exception:  # psutil missing or access denied: fall back to pgrep
         pass
 
     if platform.system() != "Windows" and shutil.which("pgrep"):
-        try:
-            out = subprocess.run(["pgrep", "-x", "rekordbox"], capture_output=True, text=True, timeout=5)
-            for line in out.stdout.split():
-                if line.strip().isdigit():
-                    pid = int(line)
-                    found.setdefault(pid, {"pid": pid, "name": "rekordbox", "exe": None})
-        except Exception:
-            pass
+        for name in names:
+            if name.endswith(".exe"):
+                continue
+            try:
+                out = subprocess.run(["pgrep", "-x", "-i", name], capture_output=True, text=True, timeout=5)
+                for line in out.stdout.split():
+                    if line.strip().isdigit():
+                        pid = int(line)
+                        found.setdefault(pid, {"pid": pid, "name": name, "exe": None})
+            except Exception:
+                pass
     return list(found.values())
+
+
+def find_rekordbox_processes() -> list[dict[str, Any]]:
+    """Return running Rekordbox *application* processes.
+
+    The background ``rekordboxAgent`` (cloud sync helper) is ignored: it keeps
+    running after the app is closed and does not hold the database.
+    """
+    return find_processes(REKORDBOX_PROCESS_NAMES)
 
 
 def is_rekordbox_running() -> bool:

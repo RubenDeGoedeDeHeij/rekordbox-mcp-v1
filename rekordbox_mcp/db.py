@@ -129,6 +129,8 @@ def _safe(obj: Any, attr: str) -> Any:
 
 
 def track_to_dict(c: Any, verbose: bool = False) -> dict[str, Any]:
+    from .cloud import file_state, in_cloud_storage
+
     key = _safe(c, "KeyName")
     d = {
         "id": str(c.ID),
@@ -143,6 +145,8 @@ def track_to_dict(c: Any, verbose: bool = False) -> dict[str, Any]:
         "length_sec": c.Length,
         "path": c.FolderPath,
         "exists": file_exists(c.FolderPath),
+        "file_state": file_state(c.FolderPath),  # local | online_only (cloud placeholder) | missing
+        "in_cloud_storage": in_cloud_storage(c.FolderPath),
     }
     if verbose:
         d.update(
@@ -246,6 +250,7 @@ def search_tracks(
     energy_max: int | None = None,
     rating_min: int | None = None,
     only_existing: bool = False,
+    only_local: bool = False,
 ) -> list[Any]:
     genres_l = {g.lower() for g in genres} if genres else None
     want_camelot = to_camelot(key) if key else None
@@ -275,5 +280,10 @@ def search_tracks(
                 continue
         if only_existing and not file_exists(c.FolderPath):
             continue
+        if only_local:
+            from .cloud import file_state
+
+            if file_state(c.FolderPath) != "local":
+                continue
         out.append(c)
     return out

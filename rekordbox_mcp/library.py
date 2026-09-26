@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from . import cloud
 from .db import active, bpm_from_db, file_exists, tables, track_label
 
 # --------------------------------------------------------------------------------------
@@ -76,8 +77,11 @@ def plan_genre_changes(
 ) -> list[dict[str, Any]]:
     """targets = [(content, explicit_genre_or_None)]"""
     changes = []
+    roots = cloud.cloud_storage_roots()
     for c, explicit in targets:
-        exists = file_exists(c.FolderPath)
+        state = cloud.file_state(c.FolderPath)
+        in_cloud = cloud.in_cloud_storage(c.FolderPath, roots)
+        exists = state == "local"  # only real local files are read/tagged/moved
         if explicit:
             genre = explicit
         elif source == "id3":
@@ -95,11 +99,17 @@ def plan_genre_changes(
             "current_file_genre": read_file_genre(c.FolderPath) if exists else None,
             "new_genre": genre,
             "file_exists": exists,
+            "file_state": state,
+            "in_cloud_storage": in_cloud,
         }
+        if state == "online_only":
+            entry["id3"] = "overgeslagen: bestand staat alleen online (cloud-placeholder); alleen Rekordbox-genre"
         if genre is None:
             entry["skip"] = "geen genre bepaald"
         elif move_files:
-            if not exists:
+            if in_cloud:
+                entry["move"] = "overgeslagen: bestand staat in Google Drive/Dropbox — verplaatsen breekt de cloud-koppeling"
+            elif not exists:
                 entry["move"] = "overgeslagen: bestand bestaat niet lokaal"
             else:
                 dst = library_root / _safe_dirname(genre) / Path(c.FolderPath).name
@@ -240,8 +250,8 @@ def find_duplicate_groups(tracks: list[Any], match: str, duration_tolerance: flo
 
 def _ref_counts(db: Any, content_id: str) -> dict[str, int]:
     return {
-        "playlists": db.query(tables.DjmdSongPlaylist).filter_by(ContentID=content_id).count(),
-        "cues": db.query(tables.DjmdCue).filter_by(ContentID=content_id).count(),
+        "playlists": db.query(tables.DjmdSongPlaylist).filter_by(ContentID=content_id, rb_local_deleted=0).count(),
+        "cues": db.query(tables.DjmdCue).filter_by(ContentID=content_id, rb_local_deleted=0).count(),
     }
 
 
@@ -250,14 +260,20 @@ def choose_keeper(db: Any, group: list[Any], library_root: Path) -> tuple[Any, l
     reference can never win against a copy whose file really exists."""
     infos = []
     for t in group:
-        exists = file_exists(t.FolderPath)
+        state = cloud.file_state(t.FolderPath)
         refs = _ref_counts(db, str(t.ID))
         in_root = bool(t.FolderPath) and _norm_path(t.FolderPath).startswith(_norm_path(str(library_root)))
-        infos.append({"t": t, "exists": exists, "refs": refs, "in_library_root": in_root})
+        infos.append({"t": t, "exists": state != "missing", "state": state, "refs": refs, "in_library_root": in_root})
 
-    existing = [i for i in infos if i["exists"]]
-    pool = existing or infos
-    reason = "bestand bestaat" if existing else "GEEN van de bestanden bestaat lokaal — keeper op basis van referenties"
+    local = [i for i in infos if i["state"] == "local"]
+    online = [i for i in infos if i["state"] == "online_only"]
+    pool = local or online or infos
+    if local:
+        reason = "bestand bestaat lokaal"
+    elif online:
+        reason = "alleen cloud-placeholders (online-only) — keeper is een online bestand"
+    else:
+        reason = "GEEN van de bestanden bestaat — keeper op basis van referenties"
 
     def score(i: dict[str, Any]) -> tuple:
         t = i["t"]
@@ -277,6 +293,7 @@ def choose_keeper(db: Any, group: list[Any], library_root: Path) -> tuple[Any, l
             "track": track_label(i["t"]),
             "path": i["t"].FolderPath,
             "exists": i["exists"],
+            "file_state": i["state"],
             "bitrate": i["t"].BitRate,
             "bpm": bpm_from_db(i["t"].BPM),
             "length_sec": i["t"].Length,
@@ -289,29 +306,32 @@ def choose_keeper(db: Any, group: list[Any], library_root: Path) -> tuple[Any, l
     return keeper, report, reason
 
 
-def merge_into_keeper(db: Any, keeper: Any, loser: Any) -> dict[str, int]:
+def merge_into_keeper(db: Any, keeper: Any, loser: Any, mode: str = "hard") -> dict[str, int]:
     """Move playlist/history/mytag references to the keeper, drop the rest,
-    then ``db.delete(loser)``. No commit here — caller commits once."""
+    then remove the loser (``db.delete`` or, with Cloud Library Sync, a soft
+    delete). No commit here — caller commits once."""
     stats = {"reassigned": 0, "deleted_rows": 0}
     kid, lid = str(keeper.ID), str(loser.ID)
     for cls in _content_tables():
-        rows = db.query(cls).filter_by(ContentID=lid).all()
+        rows = [r for r in db.query(cls).filter_by(ContentID=lid).all() if not getattr(r, "rb_local_deleted", 0)]
         if not rows:
             continue
         container = REASSIGN.get(cls.__tablename__)
         for row in rows:
             if container:
                 cont_id = getattr(row, container)
-                dup = db.query(cls).filter_by(ContentID=kid, **{container: cont_id}).first()
-                if dup is None:
+                dup = [d for d in db.query(cls).filter_by(ContentID=kid, **{container: cont_id}).all()
+                       if not getattr(d, "rb_local_deleted", 0)]
+                if not dup:
                     row.ContentID = kid
                     stats["reassigned"] += 1
                     continue
                 if cls.__tablename__ == "djmdSongPlaylist":
-                    db.remove_from_playlist(cont_id, row)  # renumbers the rest of the playlist
+                    # keeper is already in this playlist: drop the entry, renumber the rest
+                    cloud.remove_song_from_playlist(db, cont_id, row, mode)
                     stats["deleted_rows"] += 1
                     continue
-            db.delete(row)
+            cloud.remove(db, row, mode if hasattr(row, "rb_local_deleted") else "hard")
             stats["deleted_rows"] += 1
-    db.delete(loser)
+    cloud.remove(db, loser, mode)
     return stats

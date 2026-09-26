@@ -37,11 +37,41 @@ bestanden daarom zelf. Rekordbox' eigen rotatie `master.backup*.db` wordt niet a
 - Soft-deleted rijen (`rb_local_deleted=1`) worden genegeerd.
 - Staat een naam dubbel in de collectie, dan wordt er niet gegokt: de tool vraagt om het track-ID.
 
+## Cloud Library Sync & Google Drive / Dropbox
+
+Werkt ook met **Creative/Core + Cloud Option** (Cloud Library Sync) en muziek in Google Drive of
+Dropbox. Begin altijd met `get_cloud_status`: die laat zien of sync actief is (en op basis van welk
+bewijs in de database), welke verwijder-strategie gebruikt wordt, en hoeveel tracks lokaal staan,
+alleen online staan (placeholder) of ontbreken.
+
+- **Verwijderen = soft delete bij actieve sync.** Rekordbox synct via volgnummers (USN) en een
+  verwijder-vlag (`rb_local_deleted`). Een harde `DELETE` ziet de sync niet, waardoor een verwijderde
+  playlist/track kan terugkomen. Is sync actief, dan zetten `delete_playlist`,
+  `remove_tracks_from_playlist`, `dedupe_library` en `write_cue_points(replace_existing)` die vlag
+  (de USN wordt verhoogd, zodat Rekordbox het uploadt). Zonder sync: `db.delete()` + één commit.
+  De gekozen modus staat in elke dry-run (`delete_mode`). Forceren kan met `RBMCP_DELETE_MODE=soft|hard`.
+  De ingebouwde "Trial playlist - Cloud Library Sync" die elke installatie heeft, telt niet als bewijs.
+- **Online-only bestanden** (Google Drive "streamen" / Dropbox "alleen online"): het bestand bestaat als
+  placeholder, maar de audio staat niet lokaal. Zulke tracks krijgen wel het Rekordbox-genre, maar
+  **geen ID3-tag** (dat zou een download forceren). Elk track-resultaat heeft `file_state`
+  (`local` / `online_only` / `missing`) en `in_cloud_storage`; `search_tracks(only_local_files=true)`
+  filtert ze weg. Bij dedupe wint een lokale kopie van een online-only kopie.
+- **Nooit uit de cloud-map verplaatsen.** `organize_library_by_genre(move_files=true)` en de
+  dedupe-prullenbak raken bestanden onder `~/Library/CloudStorage/GoogleDrive-*`, `…/Dropbox*`,
+  `~/Google Drive` of `~/Dropbox` niet aan (extra mappen: `RBMCP_CLOUD_ROOTS`, `:`-gescheiden).
+- **Werkvolgorde met sync:** laat Rekordbox volledig syncen → sluit Rekordbox → MCP-acties →
+  open Rekordbox **op deze Mac** zodat de wijzigingen geüpload worden → pas daarna op een ander
+  apparaat werken. Schrijfacties tonen deze herinnering (`cloud_sync_note`) zolang sync actief is.
+- **Voorbehoud:** het sync-protocol is niet gedocumenteerd. Test eerst: verwijder via de MCP een
+  lege test-playlist, open Rekordbox, en kijk of hij ook op je andere apparaat verdwijnt.
+- Backups dekken de database + ANLZ-bestanden; de audio in Google Drive zit er (zoals altijd) niet in.
+
 ## Tools
 
 | Tool | Wat | Schrijft |
 |---|---|---|
 | `get_status` | paden, Rekordbox-proces, aantallen, laatste backup | – |
+| `get_cloud_status` | Cloud Library Sync actief?, verwijder-strategie, lokale / online-only / ontbrekende bestanden | – |
 | `list_playlists`, `get_playlist_tracks` | playlists/folders met pad (`Sets/2026/Vrijdag`) | – |
 | `search_tracks`, `get_track` | zoeken op tekst, BPM, genre, key (Am/8A), energy, rating | – |
 | `create_playlist` | playlist of folder, ontbrekende parent-folders worden gemaakt | ✔ |
