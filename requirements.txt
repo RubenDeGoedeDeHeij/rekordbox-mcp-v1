@@ -1,0 +1,4 @@
+mcp>=1.2
+pyrekordbox>=0.4.4
+mutagen>=1.47
+psutil>=5.9
