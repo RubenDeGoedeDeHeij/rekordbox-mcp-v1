@@ -7,10 +7,14 @@ Two separate things matter here:
   (``rb_local_deleted``). A hard ``DELETE`` leaves nothing for the sync to
   pick up, so a removed row can come back from the cloud. When sync is active
   we therefore soft-delete, like Rekordbox itself does.
-* **Online-only files.** Google Drive for desktop / Dropbox (macOS File
-  Provider) keep "streamed" files as placeholders: ``Path.exists()`` is True
+* **Online-only files.** Google Drive for desktop and Dropbox (both via macOS
+  File Provider, ``~/Library/CloudStorage/...``; legacy ``~/Dropbox`` is also
+  recognised as a cloud folder) keep "streamed" files as placeholders: ``Path.exists()`` is True
   but the audio is not on disk. Writing tags would force a download and moving
   the file out of the cloud folder breaks the link, so those are skipped.
+
+Legacy Dropbox Smart Sync (pre-File-Provider) sets no "dataless" flag; there
+online-only detection falls back to ``st_blocks == 0``.
 
 The sync protocol is not documented; everything here is based on what the
 database itself shows (see :func:`cloud_sync_status`).
@@ -63,8 +67,9 @@ def in_cloud_storage(path: str | None, roots: list[Path] | None = None) -> bool:
         r = str(root).replace("\\", "/").lower().rstrip("/")
         if p == r or p.startswith(r + "/"):
             return True
-    low = p.lower()
-    return "/library/cloudstorage/" in low or "/google drive/" in low or "/my drive/" in low
+    # fallback for paths written on another device (the folder need not exist here)
+    markers = ("/library/cloudstorage/", "/google drive/", "/my drive/", "/dropbox/")
+    return any(m in p for m in markers) or p.endswith("/dropbox")
 
 
 def file_state(path: str | None) -> str:

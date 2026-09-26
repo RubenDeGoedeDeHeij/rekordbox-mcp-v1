@@ -56,6 +56,10 @@ alleen online staan (placeholder) of ontbreken.
   **geen ID3-tag** (dat zou een download forceren). Elk track-resultaat heeft `file_state`
   (`local` / `online_only` / `missing`) en `in_cloud_storage`; `search_tracks(only_local_files=true)`
   filtert ze weg. Bij dedupe wint een lokale kopie van een online-only kopie.
+- **Dropbox** werkt hetzelfde als Google Drive: de huidige Dropbox-app (File Provider,
+  `~/Library/CloudStorage/Dropbox`) wordt volledig herkend, inclusief online-only bestanden. Met de oude
+  Dropbox Smart Sync (van vóór File Provider) wordt de map herkend, maar online-only alleen via een
+  heuristiek (0 blokken op schijf).
 - **Nooit uit de cloud-map verplaatsen.** `organize_library_by_genre(move_files=true)` en de
   dedupe-prullenbak raken bestanden onder `~/Library/CloudStorage/GoogleDrive-*`, `…/Dropbox*`,
   `~/Google Drive` of `~/Dropbox` niet aan (extra mappen: `RBMCP_CLOUD_ROOTS`, `:`-gescheiden).

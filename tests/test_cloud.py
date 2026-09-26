@@ -126,3 +126,27 @@ def test_keeper_prefers_local_over_online_only(lib, monkeypatch):
     grp = [g for g in rep["report"] if any("Demo Track 1" in t["track"] for t in g["tracks"])][0]
     keeper = [t for t in grp["tracks"] if t["keeper"]][0]
     assert keeper["file_state"] == "local" and "(copy)" in keeper["path"]
+
+
+def test_dropbox_paths_detected(monkeypatch):
+    monkeypatch.delenv("RBMCP_CLOUD_ROOTS", raising=False)
+    home = Path.home()
+    assert cloud.in_cloud_storage(str(home / "Library/CloudStorage/Dropbox/Music/x.mp3"), roots=[])
+    assert cloud.in_cloud_storage("/Users/iemand/Dropbox/rekordbox/x.mp3", roots=[])
+    assert not cloud.in_cloud_storage(str(home / "Music/DJ/02 Library/x.mp3"), roots=[])
+
+
+def test_dropbox_folder_never_moved(lib, monkeypatch):
+    music = lib / "lib" / "Music" / "DJ" / "03 Rekordbox Export"
+    dropbox = lib / "Dropbox"
+    music.rename(dropbox)  # tracks now live in a folder called "Dropbox"
+    with open_db() as db:
+        for c in db.get_content().all():
+            if c.FolderPath and str(music) in c.FolderPath:
+                c.FolderPath = c.FolderPath.replace(str(music), str(dropbox))
+        db.commit()
+    monkeypatch.delenv("RBMCP_CLOUD_ROOTS", raising=False)
+    res = server.organize_library_by_genre(assignments={"FX - SIREN": "Tech House"}, move_files=True, dry_run=False)
+    t = server.get_track("FX - SIREN")
+    assert Path(t["path"]).parent == dropbox and t["in_cloud_storage"]
+    assert "Dropbox" in res["plan"]["changes"][0]["move"]
